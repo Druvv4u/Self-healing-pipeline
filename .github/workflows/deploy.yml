@@ -23,7 +23,7 @@ jobs:
 
       - name: Step 4 - Run tests
         run: |
-          pytest tests/ -v || echo "No test found, skipping"
+          pytest tests/ -v 
 
       - name: Step 5 - Build Docker image
         run: |
