@@ -7,6 +7,9 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash   # bash with pipefail, so `| tee` does not hide failures
 
     steps:
       - name: Step 1 - Checkout code
@@ -18,16 +21,28 @@ jobs:
           python-version: "3.11"
 
       - name: Step 3 - Install dependencies
-        run: pip install flask pytest requests
+        run: pip install flask==3.0.0 pytest requests
 
       - name: Step 4 - Run tests
-        run: python -m pytest tests/ -v
+        run: python -m pytest tests/ -v 2>&1 | tee -a build.log
 
       - name: Step 5 - Build Docker image
-        run: docker build -t my-app .
+        run: docker build -t my-app . 2>&1 | tee -a build.log
 
       - name: Step 6 - Confirm image built
         run: docker images my-app
+
+      # Self-healing step 1: if anything above failed, ask the AI why.
+      - name: AI failure diagnosis
+        if: failure()
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          if [ -f build.log ]; then
+            python ai_module/analyzer.py build.log | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No build.log produced; failure happened before tests ran." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
 
   deploy:
     runs-on: ubuntu-latest
@@ -37,12 +52,13 @@ jobs:
       - name: Step 7 - Checkout code
         uses: actions/checkout@v4
 
-      - name: Step 8 - Deploy to EC2
+      - name: Step 8 - Deploy to EC2 (with automatic rollback)
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
           script: |
             cd /home/ubuntu
 
@@ -51,21 +67,38 @@ jobs:
               cd self-healing-pipeline
               git pull origin main
             else
-              git clone https://github.com/Druvv4u/self-healing-pipeline.git
+              git clone https://github.com/Druvv4u/Self-healing-pipeline.git self-healing-pipeline
               cd self-healing-pipeline
             fi
 
+            echo "💾 Tagging current image as rollback target..."
+            docker tag my-app:latest my-app:previous 2>/dev/null || true
+
             echo "🐳 Building new Docker image..."
-            docker build -t my-app .
+            docker build -t my-app:latest .
 
             echo "🔁 Restarting container with new image..."
             docker stop my-app || true
             docker rm my-app || true
             docker run -d --name my-app -p 5000:5000 \
               -e GROQ_API_KEY=${{ secrets.GROQ_API_KEY }} \
-              my-app
+              my-app:latest
 
             echo "✅ Checking health..."
             sleep 10
-            curl -f http://localhost:5000/health && echo "🎉 Deployment successful!" || echo "❌ Health check failed!"
-            
+            if curl -fs http://localhost:5000/health; then
+              echo "🎉 Deployment successful!"
+            else
+              echo "❌ Health check failed, rolling back to previous version..."
+              docker stop my-app || true
+              docker rm my-app || true
+              if docker image inspect my-app:previous >/dev/null 2>&1; then
+                docker run -d --name my-app -p 5000:5000 \
+                  -e GROQ_API_KEY=${{ secrets.GROQ_API_KEY }} \
+                  my-app:previous
+                echo "⏪ Rolled back to previous image."
+              else
+                echo "No previous image available to roll back to."
+              fi
+              exit 1
+            fi
